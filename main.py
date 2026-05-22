@@ -88,7 +88,8 @@ def main():
         time.sleep(5)
         
     print("Hoàn tất quét giá.")
-    input("\nNhấn Enter để thoát...")
+    if not is_ci():
+        input("\nNhấn Enter để thoát...")
 
 if __name__ == "__main__":
     main()
