@@ -43,6 +43,20 @@ def format_vnd(amount):
     return "{:,.0f} ₫".format(amount).replace(",", ".")
 
 
+def is_match(title, keyword):
+    """
+    Kiểm tra tên sản phẩm có thực sự khớp với từ khóa không.
+    Yêu cầu: Tất cả các từ trong keyword đều phải có mặt trong title.
+    """
+    if not title or not keyword:
+        return False
+    title_lower = title.lower()
+    for word in keyword.lower().split():
+        if word not in title_lower:
+            return False
+    return True
+
+
 def _launch_browser(playwright):
     """Khởi tạo trình duyệt với cấu hình chống phát hiện bot."""
     browser = playwright.chromium.launch(
@@ -149,7 +163,7 @@ def search_lazada(keyword, min_price, max_price):
                         seen.add(href)
 
                         title_text = (a.get_attribute("title") or a.inner_text()).strip()
-                        if len(title_text) < 5:
+                        if len(title_text) < 5 or not is_match(title_text, keyword):
                             continue
 
                         # Tìm giá gần link (trong parent)
@@ -197,7 +211,7 @@ def search_lazada(keyword, min_price, max_price):
                         t = (a.get_attribute("title") or "").strip()
                         if not t:
                             t = a.inner_text().strip()
-                        if href and len(t) > 5:
+                        if href and len(t) > 5 and is_match(t, keyword):
                             link = href
                             title_text = t
                             break
@@ -293,6 +307,9 @@ def search_shopee(keyword, min_price, max_price):
                     if not lines:
                         continue
                     title_text = max(lines, key=len)
+
+                    if not is_match(title_text, keyword):
+                        continue
 
                     # Giá: tìm trong nội dung text — format "₫xxx.xxx"
                     full_text = a.inner_text()
