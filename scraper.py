@@ -46,14 +46,31 @@ def format_vnd(amount):
 def is_match(title, keyword):
     """
     Kiểm tra tên sản phẩm có thực sự khớp với từ khóa không.
-    Yêu cầu: Tất cả các từ trong keyword đều phải có mặt trong title.
+    Xử lý các trường hợp: khoảng trắng bị sai (SC620 vs SC 620), đảo chữ, hoặc dư ký tự đặc biệt.
     """
     if not title or not keyword:
         return False
-    title_lower = title.lower()
-    for word in keyword.lower().split():
-        if word not in title_lower:
+        
+    # Bỏ dấu, ký tự đặc biệt, chỉ giữ lại chữ cái và số dạng viết liền
+    title_clean = re.sub(r'[^a-z0-9]', '', title.lower())
+    kw_clean = re.sub(r'[^a-z0-9]', '', keyword.lower())
+    
+    # Cách 1: Chuỗi từ khóa viết liền có xuất hiện thẳng trong title viết liền không?
+    if kw_clean in title_clean:
+        return True
+        
+    # Cách 2: Tách từ khóa thành các cụm chữ/số riêng lẻ (để xử lý đảo chữ, hoặc cách chữ)
+    # Ví dụ: "Chuột Aula" -> ['chuot', 'aula']
+    kw_parts = re.findall(r'[a-z0-9]+', keyword.lower())
+    
+    if not kw_parts:
+        return False
+        
+    # Tất cả các cụm của từ khóa đều phải xuất hiện trong title (dù ở vị trí nào)
+    for part in kw_parts:
+        if part not in title_clean:
             return False
+            
     return True
 
 
