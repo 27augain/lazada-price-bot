@@ -4,23 +4,36 @@ from config import get_tracking_data
 from scraper import search_products
 from telegram_alert import send_telegram_message
 
+def is_ci():
+    """Kiểm tra có đang chạy trên GitHub Actions / môi trường CI không."""
+    return os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true"
+
 def setup_env():
-    """Thiết lập file .env nếu chưa có"""
+    """
+    - Trên GitHub Actions: biến môi trường đã được inject từ Secrets → bỏ qua.
+    - Chạy local: nếu chưa có .env thì hỏi người dùng nhập vào.
+    """
+    from dotenv import load_dotenv
+
+    if is_ci():
+        # Môi trường CI — secrets đã được GitHub Actions inject sẵn
+        print("Đang chạy trên GitHub Actions, dùng Secrets đã cấu hình.")
+        return
+
+    # Chạy local
     if not os.path.exists(".env"):
-        print("=== CÀI ĐẶT LẦN ĐẦU ===")
-        print("Vui lòng nhập các thông tin sau (chỉ cần nhập 1 lần):")
+        print("=== CÀI ĐẶT LẦN ĐẦU (chỉ cần nhập 1 lần) ===")
         sheet_url = input("1. Nhập link Google Sheets CSV: ").strip()
         bot_token = input("2. Nhập TELEGRAM_BOT_TOKEN: ").strip()
-        chat_id = input("3. Nhập TELEGRAM_CHAT_ID: ").strip()
-        
+        chat_id   = input("3. Nhập TELEGRAM_CHAT_ID: ").strip()
+
         with open(".env", "w", encoding="utf-8") as f:
             f.write(f"GOOGLE_SHEET_CSV_URL={sheet_url}\n")
             f.write(f"TELEGRAM_BOT_TOKEN={bot_token}\n")
             f.write(f"TELEGRAM_CHAT_ID={chat_id}\n")
-        print("Đã lưu cấu hình vào file .env!\n")
-        # Load lại env
-        from dotenv import load_dotenv
-        load_dotenv()
+        print("Đã lưu cấu hình vào .env!\n")
+
+    load_dotenv()
 
 def format_price(price):
     return "{:,.0f} ₫".format(price).replace(',', '.')
