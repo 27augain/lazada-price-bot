@@ -1,54 +1,36 @@
 """
-scraper.py — Lấy dữ liệu sản phẩm qua API JSON của Lazada và Shopee.
-Không dùng trình duyệt → chạy được trên GitHub Actions, nhanh hơn, ổn định hơn.
+scraper.py — Dùng Playwright + Stealth để quét giá trên Lazada/Shopee.
+Stealth mode giúp tránh bị phát hiện là bot trên GitHub Actions.
 """
 
 import re
 import time
 import urllib.parse
-import requests
-
-# ─── Cấu hình chung ───────────────────────────────────────────────────────────
-
-# Headers giả lập trình duyệt thật để tránh bị chặn
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Referer": "https://www.lazada.vn/",
-    "X-Requested-With": "XMLHttpRequest",
-}
-
-_SHOPEE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-    "Accept-Language": "vi-VN,vi;q=0.9",
-    "Referer": "https://shopee.vn/search",
-    "X-Api-Source": "pc",
-    "If-None-Match-": "",
-}
-
-TIMEOUT = 20  # giây
+from playwright.sync_api import sync_playwright
 
 
 # ─── Tiện ích ─────────────────────────────────────────────────────────────────
 
+def fix_link(link, base="https://www.lazada.vn"):
+    """Chuẩn hóa link về dạng https://."""
+    if not link:
+        return None
+    link = link.strip()
+    if link.startswith("http"):
+        return link
+    if link.startswith("//"):
+        return "https:" + link
+    if link.startswith("/"):
+        return base.rstrip("/") + link
+    return None
+
+
 def parse_price(text):
-    """Trích số nguyên từ chuỗi giá như '28.990.000 ₫' hay '1,290,000đ'."""
+    """Trích giá trị số từ chuỗi giá."""
     if not text:
         return None
     cleaned = re.sub(r"[^\d]", "", str(text))
-    return int(cleaned) if cleaned else None
+    return int(cleaned) if cleaned and int(cleaned) > 1000 else None
 
 
 def is_price_valid(price_num, min_price, max_price):
@@ -57,164 +39,297 @@ def is_price_valid(price_num, min_price, max_price):
     return min_price <= price_num <= max_price
 
 
-def format_price_vnd(amount):
-    """Định dạng số thành chuỗi giá VNĐ dễ đọc."""
+def format_vnd(amount):
     return "{:,.0f} ₫".format(amount).replace(",", ".")
 
 
-# ─── Lazada API ───────────────────────────────────────────────────────────────
+def _launch_browser(playwright):
+    """Khởi tạo trình duyệt với cấu hình chống phát hiện bot."""
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ],
+    )
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1366, "height": 768},
+        locale="vi-VN",
+        timezone_id="Asia/Ho_Chi_Minh",
+    )
+    return browser, context
+
+
+def _apply_stealth(page):
+    """Inject JS để ẩn dấu hiệu headless/bot."""
+    page.add_init_script("""
+        // Xóa navigator.webdriver
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        // Fake plugins
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5]
+        });
+        // Fake languages
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['vi-VN', 'vi', 'en-US', 'en']
+        });
+        // Fake chrome runtime
+        window.chrome = { runtime: {} };
+    """)
+
+
+# ─── Lazada ───────────────────────────────────────────────────────────────────
 
 def search_lazada(keyword, min_price, max_price):
-    """
-    Gọi API AJAX của Lazada — trả về JSON danh sách sản phẩm.
-    sort=price&order=ASC → giá thấp nhất lên đầu.
-    """
+    """Tìm kiếm Lazada, sort giá tăng dần."""
     encoded = urllib.parse.quote_plus(keyword)
     url = (
-        f"https://www.lazada.vn/catalog/?ajax=true"
-        f"&q={encoded}"
+        f"https://www.lazada.vn/catalog/"
+        f"?q={encoded}"
         f"&price={min_price}-{max_price}"
-        f"&sort=price&order=ASC"
-        f"&page=1"
+        f"&sort=priceasc"
     )
 
-    print(f"  [Lazada API] GET {url}")
     results = []
-
     try:
-        resp = requests.get(url, headers=_HEADERS, timeout=TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
+        with sync_playwright() as p:
+            browser, context = _launch_browser(p)
+            page = context.new_page()
+            _apply_stealth(page)
+
+            # Chặn ảnh để tải nhanh
+            page.route("**/*.{png,jpg,jpeg,gif,webp,svg}", lambda r: r.abort())
+
+            print(f"  [Lazada] Mở: {url}")
+            page.goto(url, timeout=60000, wait_until="networkidle")
+            page.wait_for_timeout(3000)
+
+            # Debug: lưu nội dung trang để xem có bị chặn không
+            title = page.title()
+            print(f"  [Lazada] Tiêu đề trang: {title}")
+
+            # Thử nhiều selector
+            card_sels = [
+                '[data-qa-locator="product-item"]',
+                'div[data-tracking="product-card"]',
+                '.Bm3ON',
+                'div.qmXQo',
+                'div[class*="product"]',
+            ]
+            found_sel = None
+            for sel in card_sels:
+                try:
+                    page.wait_for_selector(sel, timeout=5000)
+                    found_sel = sel
+                    break
+                except Exception:
+                    continue
+
+            if not found_sel:
+                # Fallback: tìm tất cả link có chứa /products/
+                print("  [Lazada] Không tìm thấy card selector, thử tìm link sản phẩm...")
+                links = page.locator('a[href*="/products/"]').all()
+                print(f"  [Lazada] Tìm thấy {len(links)} link sản phẩm")
+
+                seen = set()
+                for a in links:
+                    if len(results) >= 5:
+                        break
+                    try:
+                        href = fix_link(a.get_attribute("href"))
+                        if not href or href in seen:
+                            continue
+                        seen.add(href)
+
+                        title_text = (a.get_attribute("title") or a.inner_text()).strip()
+                        if len(title_text) < 5:
+                            continue
+
+                        # Tìm giá gần link (trong parent)
+                        parent = a.locator("xpath=ancestor::div[contains(@class,'card') or contains(@class,'item') or contains(@class,'product')]").first
+                        price_text = ""
+                        price_num = None
+                        if parent.count() > 0:
+                            spans = parent.locator("span:has-text('₫'), span[class*='price']").all()
+                            for sp in spans:
+                                txt = sp.inner_text().strip()
+                                num = parse_price(txt)
+                                if num and is_price_valid(num, min_price, max_price):
+                                    price_num = num
+                                    price_text = format_vnd(num)
+                                    break
+
+                        if price_num:
+                            print(f"  [Lazada] ✓ {title_text[:45]} — {price_text}")
+                            results.append({
+                                "title": title_text,
+                                "link": href,
+                                "price_text": price_text,
+                                "price_num": price_num,
+                            })
+                    except Exception:
+                        continue
+
+                browser.close()
+                results.sort(key=lambda x: x["price_num"])
+                return results
+
+            print(f"  [Lazada] Dùng selector: {found_sel}")
+            cards = page.locator(found_sel).all()
+            print(f"  [Lazada] Số card: {len(cards)}")
+
+            for card in cards:
+                if len(results) >= 5:
+                    break
+                try:
+                    # Link + title
+                    link = None
+                    title_text = None
+                    for a in card.locator("a").all():
+                        href = fix_link(a.get_attribute("href"))
+                        t = (a.get_attribute("title") or "").strip()
+                        if not t:
+                            t = a.inner_text().strip()
+                        if href and len(t) > 5:
+                            link = href
+                            title_text = t
+                            break
+
+                    if not link:
+                        continue
+
+                    # Giá — lấy tất cả giá trong card, chọn giá nhỏ nhất hợp lệ
+                    price_text = ""
+                    price_num = None
+                    spans = card.locator("span:has-text('₫'), span[class*='price'], div[class*='price']").all()
+                    candidates = []
+                    for sp in spans:
+                        txt = sp.inner_text().strip()
+                        num = parse_price(txt)
+                        if num and is_price_valid(num, min_price, max_price):
+                            candidates.append((num, format_vnd(num)))
+                    if candidates:
+                        candidates.sort(key=lambda x: x[0])
+                        price_num, price_text = candidates[0]
+
+                    if not price_num:
+                        continue
+
+                    print(f"  [Lazada] ✓ {title_text[:45]} — {price_text}")
+                    results.append({
+                        "title": title_text,
+                        "link": link,
+                        "price_text": price_text,
+                        "price_num": price_num,
+                    })
+                except Exception as e:
+                    continue
+
+            browser.close()
+
     except Exception as e:
-        print(f"  [Lazada API] Lỗi request: {e}")
-        return results
-
-    items = data.get("listItems") or data.get("items") or []
-    print(f"  [Lazada API] Nhận được {len(items)} sản phẩm")
-
-    for item in items:
-        try:
-            name = item.get("name") or item.get("title") or ""
-            if not name:
-                continue
-
-            # Link sản phẩm
-            item_url = item.get("itemUrl") or item.get("url") or ""
-            if item_url.startswith("//"):
-                item_url = "https:" + item_url
-            elif item_url.startswith("/"):
-                item_url = "https://www.lazada.vn" + item_url
-            if not item_url:
-                continue
-
-            # Giá — Lazada thường trả về "priceShow" hoặc "price"
-            price_raw = (
-                item.get("priceShow")
-                or item.get("price")
-                or item.get("salePrice")
-                or ""
-            )
-            price_num = parse_price(price_raw)
-
-            # Nếu giá là số nguyên lớn (Lazada đôi khi trả về xu × 100)
-            if price_num and price_num > max_price * 100:
-                price_num = price_num // 100
-
-            if not is_price_valid(price_num, min_price, max_price):
-                print(f"  [Lazada] Bỏ qua (giá={price_num}): {name[:40]}")
-                continue
-
-            price_text = format_price_vnd(price_num)
-            print(f"  [Lazada] ✓ {name[:45]!r} — {price_text}")
-            results.append({
-                "title": name.strip(),
-                "link": item_url,
-                "price_text": price_text,
-                "price_num": price_num,
-            })
-
-            if len(results) >= 5:
-                break
-
-        except Exception as e:
-            print(f"  [Lazada] Lỗi parse item: {e}")
-            continue
+        print(f"[Lazada] Lỗi: {e}")
 
     results.sort(key=lambda x: x["price_num"])
     return results
 
 
-# ─── Shopee API ───────────────────────────────────────────────────────────────
+# ─── Shopee ───────────────────────────────────────────────────────────────────
 
 def search_shopee(keyword, min_price, max_price):
-    """
-    Gọi API tìm kiếm của Shopee — trả về JSON.
-    by=price&order=asc → giá thấp nhất lên đầu.
-    Shopee trả giá dạng xu × 100000 nên phải chia 100000.
-    """
+    """Tìm kiếm Shopee, sort giá tăng dần."""
     encoded = urllib.parse.quote_plus(keyword)
-    # price_min/max là giá thật (VNĐ), Shopee tự convert nội bộ
     url = (
-        f"https://shopee.vn/api/v4/search/search_items"
-        f"?by=price&keyword={encoded}"
-        f"&limit=10&newest=0&order=asc"
-        f"&page_type=search&scenario=PAGE_GLOBAL_SEARCH&version=2"
-        f"&price_min={min_price}&price_max={max_price}"
+        f"https://shopee.vn/search"
+        f"?keyword={encoded}"
+        f"&minPrice={min_price}"
+        f"&maxPrice={max_price}"
+        f"&sortBy=price"
     )
 
-    print(f"  [Shopee API] GET {url}")
     results = []
-
     try:
-        resp = requests.get(url, headers=_SHOPEE_HEADERS, timeout=TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
+        with sync_playwright() as p:
+            browser, context = _launch_browser(p)
+            page = context.new_page()
+            _apply_stealth(page)
+
+            page.route("**/*.{png,jpg,jpeg,gif,webp,svg}", lambda r: r.abort())
+
+            print(f"  [Shopee] Mở: {url}")
+            page.goto(url, timeout=60000, wait_until="networkidle")
+            page.wait_for_timeout(5000)
+
+            title = page.title()
+            print(f"  [Shopee] Tiêu đề trang: {title}")
+
+            # Shopee hiện tại render card bằng thẻ <a> chứa link sản phẩm
+            # Tìm tất cả link sản phẩm trực tiếp
+            product_links = page.locator('a[href*="-i."]').all()
+            print(f"  [Shopee] Tìm thấy {len(product_links)} link sản phẩm")
+
+            seen = set()
+            for a in product_links:
+                if len(results) >= 5:
+                    break
+                try:
+                    href = a.get_attribute("href")
+                    href = fix_link(href, base="https://shopee.vn")
+                    if not href or href in seen:
+                        continue
+                    seen.add(href)
+
+                    # Title từ text bên trong link
+                    title_text = a.inner_text().strip()
+                    # Shopee thường có nhiều text lồng nhau, lấy dòng dài nhất
+                    lines = [l.strip() for l in title_text.split("\n") if len(l.strip()) > 5]
+                    if not lines:
+                        continue
+                    title_text = max(lines, key=len)
+
+                    # Giá: tìm trong nội dung text — format "₫xxx.xxx"
+                    full_text = a.inner_text()
+                    price_matches = re.findall(r"₫[\d\.]+", full_text)
+                    if not price_matches:
+                        price_matches = re.findall(r"[\d\.]+₫", full_text)
+                    if not price_matches:
+                        price_matches = re.findall(r"[\d]{3,}\.[\d]{3}", full_text)
+
+                    price_num = None
+                    price_text = ""
+                    candidates = []
+                    for pm in price_matches:
+                        num = parse_price(pm)
+                        if num and is_price_valid(num, min_price, max_price):
+                            candidates.append((num, format_vnd(num)))
+                    if candidates:
+                        candidates.sort(key=lambda x: x[0])
+                        price_num, price_text = candidates[0]
+
+                    if not price_num:
+                        continue
+
+                    print(f"  [Shopee] ✓ {title_text[:45]} — {price_text}")
+                    results.append({
+                        "title": title_text,
+                        "link": href,
+                        "price_text": price_text,
+                        "price_num": price_num,
+                    })
+                except Exception:
+                    continue
+
+            browser.close()
+
     except Exception as e:
-        print(f"  [Shopee API] Lỗi request: {e}")
-        return results
-
-    items = data.get("items") or []
-    print(f"  [Shopee API] Nhận được {len(items)} sản phẩm")
-
-    for item in items:
-        try:
-            basic = item.get("item_basic") or item
-            name = basic.get("name") or ""
-            if not name:
-                continue
-
-            shopid  = basic.get("shopid")
-            itemid  = basic.get("itemid")
-            if not shopid or not itemid:
-                continue
-
-            # Tạo link sản phẩm chuẩn Shopee
-            slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-            item_url = f"https://shopee.vn/{slug}-i.{shopid}.{itemid}"
-
-            # Giá Shopee = xu × 100000 → chia 100000 để ra VNĐ
-            price_raw = basic.get("price") or basic.get("price_min") or 0
-            price_num = int(price_raw) // 100000
-
-            if not is_price_valid(price_num, min_price, max_price):
-                print(f"  [Shopee] Bỏ qua (giá={price_num}): {name[:40]}")
-                continue
-
-            price_text = format_price_vnd(price_num)
-            print(f"  [Shopee] ✓ {name[:45]!r} — {price_text}")
-            results.append({
-                "title": name.strip(),
-                "link": item_url,
-                "price_text": price_text,
-                "price_num": price_num,
-            })
-
-            if len(results) >= 5:
-                break
-
-        except Exception as e:
-            print(f"  [Shopee] Lỗi parse item: {e}")
-            continue
+        print(f"[Shopee] Lỗi: {e}")
 
     results.sort(key=lambda x: x["price_num"])
     return results
@@ -223,15 +338,12 @@ def search_shopee(keyword, min_price, max_price):
 # ─── Hàm chính ────────────────────────────────────────────────────────────────
 
 def search_products(keyword, min_price, max_price):
-    """
-    Tìm trên Lazada API trước, nếu không có thì tìm Shopee API.
-    Không dùng trình duyệt → nhanh & ổn định trên GitHub Actions.
-    """
-    print("Thử Lazada API (giá tăng dần)...")
+    """Tìm Lazada trước, nếu không có thì tìm Shopee."""
+    print("Thử quét Lazada (giá tăng dần)...")
     res = search_lazada(keyword, min_price, max_price)
     if res:
         return res
 
-    time.sleep(2)  # tránh rate limit
-    print("Lazada không trả kết quả. Thử Shopee API (giá tăng dần)...")
+    time.sleep(2)
+    print("Lazada không có. Thử quét Shopee (giá tăng dần)...")
     return search_shopee(keyword, min_price, max_price)

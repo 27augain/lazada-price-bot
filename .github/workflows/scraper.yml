@@ -2,9 +2,8 @@ name: Price Tracker Cron
 
 on:
   schedule:
-    # Chạy vào phút 0 của mỗi giờ thứ 2 (mỗi 2 tiếng)
     - cron: '0 */2 * * *'
-  workflow_dispatch: # Cho phép chạy thủ công từ giao diện GitHub
+  workflow_dispatch:
 
 jobs:
   scrape-and-notify:
@@ -23,6 +22,9 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
+
+    - name: Cài đặt Playwright + system deps
+      run: playwright install --with-deps chromium
 
     - name: Chạy script quét giá
       env:
